@@ -1,93 +1,121 @@
-import cv2
-import torch
+import cv2, time, torch
 from PIL import Image
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
-# --- Configuration / model loading ---
+MODEL_ID = "apple/FastVLM-0.5B"
+MAX_SIDE = 640  
+MAX_NEW_TOKENS = 48
 
-MODEL_ID = "apple/FastVLM-0.5B"  # اسم النموذج على Hugging Face أو ما تحمّله محليًا
+def resize_keep_aspect(bgr, max_side):
+    h, w = bgr.shape[:2]
+    if max(h, w) <= max_side: return bgr
+    s = max_side / float(max(h, w))
+    return cv2.resize(bgr, (int(w*s), int(h*s)), interpolation=cv2.INTER_AREA)
 
-def load_model(model_id):
-    # Load tokenizer (with trust_remote_code=True إذا النموذج يعدل أو يستخدم كود مخصص)  
-    tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True, use_fast=False)
-    # Load model، نستخدم torch_dtype=torch.float16 إذا GPU يدعم، ونرسله إلى CUDA إذا متاح
-    model = AutoModelForCausalLM.from_pretrained(
-        model_id,
-        dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
-        trust_remote_code=True,
-        # يمكنك استخدام device_map="auto" أو manual placement
-        device_map="auto"
-    )
-    return tokenizer, model
+# --- Load model on GPU if available ---
+tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, trust_remote_code=True, use_fast=False)
+dtype = torch.float16 if torch.cuda.is_available() else torch.float32
+model = AutoModelForCausalLM.from_pretrained(MODEL_ID, dtype=dtype, trust_remote_code=True)
+if torch.cuda.is_available():
+    model = model.to("cuda")
+torch.backends.cuda.matmul.allow_tf32 = True
 
-# Function to generate caption from an image
-def caption_image(tokenizer, model, pil_img, max_new_tokens=50):
-    # Prepare prompt / template مع وسم الصورة
-    messages = [
-        {"role": "user", "content": "<image>\nDescribe this image in detail in arabic."}
-    ]
+# --- Sanity prints ---
+print("CUDA available:", torch.cuda.is_available())
+if torch.cuda.is_available(): print("GPU:", torch.cuda.get_device_name(0))
+print("Model device:", next(model.parameters()).device)
+
+# --- Open camera ---
+cap = cv2.VideoCapture(1)
+cap.set(cv2.CAP_PROP_FRAME_WIDTH,  960)
+cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 540)
+cap.set(cv2.CAP_PROP_FPS,          60)
+cap.set(cv2.CAP_PROP_BUFFERSIZE,   1)
+
+# --- Measure end-to-end FPS over a sliding window ---
+t_last = time.time()
+frames = 0
+
+def caption(pil_img):
+    # Build a minimal chat-turn with an <image> placeholder
+    messages = [{"role": "user", "content": "<image>\nDescribe this image."}]
     rendered = tokenizer.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
-    # Split حول وسم <image>
     pre, post = rendered.split("<image>", 1)
-    # ترميز النصوص قبل وبعد
-    pre_ids = tokenizer(pre, return_tensors="pt", add_special_tokens=False).input_ids
+    pre_ids  = tokenizer(pre,  return_tensors="pt", add_special_tokens=False).input_ids
     post_ids = tokenizer(post, return_tensors="pt", add_special_tokens=False).input_ids
-    # IMAGE_TOKEN_INDEX هو مؤشر يُستخدم كتمثيل للصورة في تسلسل الإدخال
-    IMAGE_TOKEN_INDEX = -200  # النموذج قد يستخدم قيمة ثابتة كهذه
+
+    IMAGE_TOKEN_INDEX = -200
     img_tok = torch.tensor([[IMAGE_TOKEN_INDEX]], dtype=pre_ids.dtype)
-    input_ids = torch.cat([pre_ids, img_tok, post_ids], dim=1).to(model.device)
-    attention_mask = torch.ones_like(input_ids, device=model.device)
-    # معالجة الصورة: النموذج يوفر وظيفة get_vision_tower
-    px = model.get_vision_tower().image_processor(images=pil_img, return_tensors="pt")["pixel_values"]
-    px = px.to(model.device, dtype=model.dtype)
-    # توليد النصوص (بدون حساب التدرجات)
+    input_ids = torch.cat([pre_ids, img_tok, post_ids], dim=1)
+
+    device = next(model.parameters()).device
+    input_ids = input_ids.to(device, non_blocking=True)
+    attention = torch.ones_like(input_ids, device=device)
+
+    vision = model.get_vision_tower()
+    px = vision.image_processor(images=pil_img, return_tensors="pt")["pixel_values"]
+    px = px.to(device, dtype=next(model.parameters()).dtype, non_blocking=True)
+
+    if device.type == "cuda": torch.cuda.synchronize()
+    t0 = time.time()
     with torch.no_grad():
-        output_ids = model.generate(
-            inputs=input_ids,
-            attention_mask=attention_mask,
-            images=px,
-            max_new_tokens=max_new_tokens,
-        )
-    # فك ترميز المخرجات إلى نص
-    caption = tokenizer.decode(output_ids[0], skip_special_tokens=True)
-    return caption
+        ids = model.generate(inputs=input_ids, attention_mask=attention, images=px,
+                             max_new_tokens=MAX_NEW_TOKENS, do_sample=False)
+    if device.type == "cuda": torch.cuda.synchronize()
+    print(f"Model latency: {(time.time()-t0)*1000:.0f} ms")
+    return tokenizer.decode(ids[0], skip_special_tokens=True)
 
-def main():
-    # تحميل النموذج
-    tokenizer, model = load_model(MODEL_ID)
-    # فتح الكاميرا (0 = الكاميرا الافتراضية)
-    cap = cv2.VideoCapture(1)
-    if not cap.isOpened():
-        print("Error: cannot open camera")
-        return
+last_caption = ""
+caption_change_threshold = 0.5  # Adjust this value (0.0 to 1.0)
 
-    print("Starting live captioning. Press 'q' to quit.")
+print("Press 'q' to quit.")
+while True:
+    ok, frame = cap.read()
+    if not ok: continue
 
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
+    frames += 1
+    # Check if a frame should be processed
+    if frames % 5 != 0:
+        cv2.imshow("Live", frame)
+    else:
+        small = resize_keep_aspect(frame, MAX_SIDE)
+        rgb = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
+        pil = Image.fromarray(rgb)
+        
+        # Generate a new caption
+        new_caption = caption(pil)
+        
+        # Compare new caption with the last one
+        if not last_caption:
+            # First run, just set the caption
+            last_caption = new_caption
+            print("Caption:", last_caption)
+        else:
+            # Calculate the similarity between captions
+            # Using Jaccard similarity as a simple metric
+            set1 = set(last_caption.lower().split())
+            set2 = set(new_caption.lower().split())
+            intersection = len(set1.intersection(set2))
+            union = len(set1.union(set2))
+            jaccard_similarity = intersection / union if union > 0 else 0
 
-        # OpenCV يعطي BGR، نحوله إلى RGB و PIL Image
-        img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        pil_img = Image.fromarray(img_rgb)
+            if jaccard_similarity < caption_change_threshold:
+                # If captions are sufficiently different, update
+                last_caption = new_caption
+                print("Caption:", last_caption)
+        
+        # Display the frame with the current (potentially old) caption
+        cv2.putText(small, last_caption[:80], (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+        cv2.imshow("Live", small)
+    
+    if cv2.waitKey(1) & 0xFF == ord('q'):
+        break
 
-        # توليد التسمية الوصفية للصورة
-        caption = caption_image(tokenizer, model, pil_img, max_new_tokens=40)
+    # simple FPS display
+    now = time.time()
+    if now - t_last >= 2.0:
+        print(f"E2E FPS ~ {frames/(now - t_last):.1f}")
+        frames, t_last = 0, now
 
-        # طباعة الوصف في سطر الأوامر
-        print("Caption:", caption)
-
-        # عرض الإطار مع العنوان (اختياري)
-        cv2.putText(frame, caption, (10,30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,255,0), 2)
-        cv2.imshow("Live Camera", frame)
-
-        # الانتظار لمفتاح “q” للخروج
-        if cv2.waitKey(1) & 0xFF == ord('q'):
-            break
-
-    cap.release()
-    cv2.destroyAllWindows()
-
-if __name__ == "__main__":
-    main()
+cap.release()
+cv2.destroyAllWindows()
